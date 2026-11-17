@@ -18,6 +18,8 @@ from itertools import accumulate
 from random import choice, choices, random, sample
 
 import networkx as nx
+import numpy as np
+from networkx.algorithms.bridges import bridges
 
 
 # ---------------------------------------------------------------------------
@@ -42,8 +44,9 @@ def genetic_algorithm_01(graph: nx.Graph, pop_size: int = 100, generations: int 
     "log". The final fitness and its ratio to a matching-based reference
     value are printed.
     """
-    edges = list(graph.edges())
-    n_edges = len(edges)
+    n_edges = len(graph.edges())
+    e = [(min(u,v),max(u,v)) for (u, v) in graph.edges()]
+    edges = dict(zip(e, range(n_edges)))
     n_elite = max(1, math.ceil(pop_size * elite_rate))
 
     # Initial population: random 0/1 genomes.
@@ -62,15 +65,20 @@ def genetic_algorithm_01(graph: nx.Graph, pop_size: int = 100, generations: int 
     with open("log", "w", encoding="utf-8") as log:
         writer = csv.writer(log, lineterminator="\n")
         for _ in range(generations):
-            population, best_of_generation = new_gen(
+            population, fitnesses, grades, ones, zeroes = new_gen(
                 graph, edges, population, n_elite, mutation_rate, crossing)
-            writer.writerow([best_of_generation])
+            np_colors = np.array([f[0] for f in fitnesses])
+            np_grades = np.array(grades)
+            np_ones = np.array(ones)
+            np_zeroes = np.array(zeroes)
+            writer.writerow([np.max(np_colors),np.max(np_grades), np.mean(np_colors), np.mean(np_grades), np.mean(np_ones), np.mean(np_zeroes)])
 
     # Pick the final winner and compare it with a reference value.
     best_genome = max(population, key=lambda genome: fitness(graph, edges, genome))
-    best_fitness = fitness(graph, edges, best_genome)
+    best_fitness = list(fitness(graph, edges, best_genome))
+    best_fitness[1] = best_fitness[1]*5
     matching = len(nx.max_weight_matching(graph, maxcardinality=True)) + 1
-    print(best_fitness, f"{round(best_fitness / matching, 2) * 100}%")
+    print(f"Počet farieb: {best_fitness[0]}, Počet 'dobrych' mostov: {best_fitness[1]}, V porovnaní z matching {round(best_fitness[0] / matching, 2) * 100}%")
     return best_genome
 
 
@@ -81,7 +89,13 @@ def new_gen(graph, edges, population, n_elite, mutation_rate, crossing):
         (new_population, best) where `best` is the (fitness, genome) pair of
         the best individual of the *current* population.
     """
-    grades = [fitness(graph, edges, genome) for genome in population]
+    p = [normalize(genome) for genome in population]
+    fitnesses = [fitness(graph,edges,genome) for genome in p]
+    grades = [sum(f) for f in fitnesses]
+
+    ## 01 rate for logs
+    ones = [sum(genome)/len(genome) for genome in p]
+    zeroes = [(len(genome) - sum(genome))/len(genome) for genome in p]
 
     # Selection weights: shifted so the worst genome has weight 1, then
     # squared to favour better genomes more strongly.
@@ -89,13 +103,12 @@ def new_gen(graph, edges, population, n_elite, mutation_rate, crossing):
     cum_weights = list(accumulate(weights))
 
     ranked = sorted(zip(grades, population), key=lambda t: t[0], reverse=True)
-    best = ranked[0]
     elite = [genome for (_, genome) in ranked[:n_elite]]
 
     # Offspring fill the population; the elite survive unchanged.
     new_population = crossing(graph, edges, population, n_elite, mutation_rate, cum_weights)
     new_population.extend(elite)
-    return new_population, best
+    return new_population, fitnesses, grades, ones, zeroes
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +126,7 @@ def uniform_crossing(graph, edges, population, n_elite, mutation_rate, cum_weigh
     return offspring
 
 
-def edge_cut_crossover(graph, edges, population, n_elite, mutation_rate, cum_weights):
+def edge_cut_crossover(graph, edges: dict[tuple[int,int], int], population, n_elite, mutation_rate, cum_weights):
     """Edge-cut crossover.
 
     A random minimum edge cut splits the graph in two parts. Edges inside
@@ -157,7 +170,7 @@ def get_crossover_indices(graph, edges):
     cut_edges = {frozenset(edge) for edge in cut}
     part1_indices, part2_indices, cut_indices = set(), set(), set()
 
-    for i, (u, v) in enumerate(edges):
+    for (u, v), i in edges.items():
         if frozenset((u, v)) in cut_edges:
             cut_indices.add(i)
         elif u in part1:
@@ -176,29 +189,82 @@ def mutate(genome, mutation_rate):
     """Flip each gene (0 <-> 1) independently with probability `mutation_rate`."""
     return [g ^ 1 if random() < mutation_rate else g for g in genome]
 
-
+def normalize(genome):
+    np_genome = np.array(genome)
+    flipped = [g ^ 1 for g in genome]
+    np_flipped = np.array(flipped)
+    if np.count_nonzero(np_flipped) > np.count_nonzero(np_genome):
+        return genome
+    return flipped
 def select_pair(cum_weights, population):
     """Pick two parents (with replacement) using cumulative selection weights."""
     return list(choices(population, cum_weights=cum_weights, k=2))
 
 
-def fitness(graph: nx.Graph, edges, genome: list[int]) -> float:
-    """Return the number of connected components of the 0-colored subgraph
-    plus that of the 1-colored subgraph (higher is better)."""
-    zero_edges = []
-    one_edges = []
+def fitness(graph: nx.Graph, edges, genome: list[int]):
+    zero_components, zero_bridges = dfs_components_bridges(graph,1, edges, genome)
+    one_components, one_bridges = dfs_components_bridges(graph,0, edges, genome)
+    return (one_components + zero_components, 0.2*(zero_bridges + one_bridges))
 
-    for edge, color in zip(edges, genome):
-        if color == 0:
-            zero_edges.append(edge)
-        else:
-            one_edges.append(edge)
+def dfs_components_bridges(graph: nx.Graph, color, edges, genome: list[int]):
+    adj = graph._adj
+    n = len(graph.nodes())
+    tin = [-1]*n
+    low = [-1]*n
+    subtree = [1]*n
+    timer = 0
+    bridges = []
+    components = 0
 
-    zero_graph = graph.edge_subgraph(zero_edges)
-    one_graph = graph.edge_subgraph(one_edges)
+    for start in graph.nodes():
+        if tin[start] != -1:
+            continue
 
-    return nx.number_connected_components(zero_graph) + nx.number_connected_components(one_graph)
+        for neighbor in adj[start]:
+            if genome[edges[(min(start, neighbor), max(start, neighbor))]] != color:
+                components += 1
+                break
 
+
+
+        stack = [(start, -1, iter(adj[start]))]
+
+        tin[start] = low[start] = timer
+        timer += 1
+
+        while stack:
+            v, parent, neighbors = stack[-1]
+
+            try:
+                to = next(neighbors)
+
+                if to == parent:
+                    continue
+
+                if genome[edges[(min(v,to),max(v,to))]] == color:
+                    continue
+
+                if tin[to] != -1:
+                    low[v] = min(low[v], tin[to])
+
+                else:
+                    tin[to] = low[to] = timer
+                    timer += 1
+
+                    stack.append((to, v, iter(adj[to])))
+
+            except StopIteration:
+                stack.pop()
+
+                if parent != -1:
+                    subtree[parent] += subtree[v]
+
+                    low[parent] = min(low[parent], low[v])
+
+                    if low[v] > tin[parent] and subtree[v] > 1:
+                        bridges.append((parent, v))
+
+    return components, len(bridges)
 
 def generate_genome(length: int) -> list[int]:
     """Create a random 0/1 genome of the given length."""
